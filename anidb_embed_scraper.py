@@ -5,19 +5,21 @@ Reads config from environment variables (set via workflow inputs) with
 sensible fallbacks so it can still be run locally.
 
 Environment variables (all optional, fall back to defaults):
-  ANIME_SLUG   – slug from anidb.app/anime/<slug>   [naruto-shippuden-3687]
-  LANG_FILTER  – "all" | "eng" | "jpn"              [all]
-  EP_START     – first episode number (inclusive)    [1]
-  EP_END       – last episode number (inclusive)     [last episode]
-  DELAY        – seconds between requests            [0.5]
-  OUTPUT_FILE  – output JSON file path               [anidb_embeds.json]
-  DEBUG        – "true" to enable verbose debug log  [false]
+  ANIME_SLUG        – slug from anidb.app/anime/<slug>         [naruto-shippuden-3687]
+  LANG_FILTER       – "all" | "eng" | "jpn"                    [all]
+  EP_START          – first episode number (inclusive)          [1]
+  EP_END            – last episode number (inclusive)           [last episode]
+  DELAY             – seconds between requests                  [0.5]
+  OUTPUT_FILE       – output JSON file path                     [anidb_embeds.json]
+  DEBUG             – "true" to enable verbose debug log        [false]
+  SCRAPER_PROXY     – single proxy  http://user:pass@host:port  [none]
+  SCRAPER_PROXY_LIST– comma-separated proxies, rotated on 403  [none]
 
 Run locally:
   python anidb_embed_scraper.py
 
-Run with overrides:
-  ANIME_SLUG=bleach-269 EP_START=1 EP_END=10 python anidb_embed_scraper.py
+Run with proxy list:
+  SCRAPER_PROXY_LIST="http://u:p@h1:p1,http://u:p@h2:p2" python anidb_embed_scraper.py
 """
 
 import json
@@ -30,14 +32,14 @@ import traceback
 from pathlib import Path
 
 try:
-    from curl_cffi import requests                      # Chrome TLS fingerprint — bypasses Cloudflare JA3/JA4
+    from curl_cffi import requests                  # Chrome TLS fingerprint — bypasses Cloudflare JA3/JA4
     from curl_cffi.requests.exceptions import (
         ConnectionError as _ConnErr,
         Timeout         as _TimeoutErr,
     )
     CURL_CFFI = True
 except ImportError:
-    import requests                                     # fallback (will not bypass Cloudflare on GH Actions)
+    import requests                                 # fallback (will not bypass Cloudflare on GH Actions)
     _ConnErr    = requests.ConnectionError
     _TimeoutErr = requests.Timeout
     CURL_CFFI   = False
@@ -47,64 +49,77 @@ except ImportError:
 # ══════════════════════════════════════════
 
 ANIME_SLUG   = os.environ.get("ANIME_SLUG",   "naruto-shippuden-3687")
-LANG_FILTER = os.environ.get("LANG_FILTER",  "all")
-EP_START    = int(os.environ.get("EP_START", "1"))
-_ep_end_raw = os.environ.get("EP_END",       "").strip()
-EP_END      = int(_ep_end_raw) if _ep_end_raw else None
-DELAY       = float(os.environ.get("DELAY",  "0.5"))
-OUTPUT_FILE = os.environ.get("OUTPUT_FILE",  "anidb_embeds.json")
+LANG_FILTER  = os.environ.get("LANG_FILTER",  "all")
+EP_START     = int(os.environ.get("EP_START", "1"))
+_ep_end_raw  = os.environ.get("EP_END", "").strip()
+EP_END       = int(_ep_end_raw) if _ep_end_raw else None
+DELAY        = float(os.environ.get("DELAY",  "0.5"))
+OUTPUT_FILE  = os.environ.get("OUTPUT_FILE",  "anidb_embeds.json")
 DEBUG        = os.environ.get("DEBUG", "false").lower() == "true"
-SCRAPER_PROXY = os.environ.get("SCRAPER_PROXY", "").strip()  # e.g. "http://user:pass@host:port"
+
+# Proxy config — SCRAPER_PROXY_LIST takes priority; falls back to SCRAPER_PROXY
+_proxy_list_raw = os.environ.get("SCRAPER_PROXY_LIST", "").strip()
+_proxy_single   = os.environ.get("SCRAPER_PROXY",      "").strip()
+
+if _proxy_list_raw:
+    PROXY_LIST = [p.strip() for p in _proxy_list_raw.split(",") if p.strip()]
+elif _proxy_single:
+    PROXY_LIST = [_proxy_single]
+else:
+    PROXY_LIST = []
 
 # ══════════════════════════════════════════
 
-BASE_URL    = "https://anidb.app"
-LOG_FILE    = "anidb_debug.log"
-USER_AGENT  = (
+BASE_URL   = "https://anidb.app"
+LOG_FILE   = "anidb_debug.log"
+USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/150.0.0.0 Safari/537.36"
+    "Chrome/124.0.0.0 Safari/537.36"
 )
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
 def setup_logging():
-    """Configure logging: always write DEBUG to file; console level depends on DEBUG flag."""
     log = logging.getLogger("anidb")
     log.setLevel(logging.DEBUG)
-
     fmt = logging.Formatter(
         "%(asctime)s  %(levelname)-8s  %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
-
-    # File handler — always full DEBUG detail
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
     log.addHandler(fh)
 
-    # Console handler — INFO normally, DEBUG when DEBUG=true
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.DEBUG if DEBUG else logging.INFO)
     ch.setFormatter(fmt)
     log.addHandler(ch)
-
     return log
 
 
 log = setup_logging()
 
 
-# ── HTTP helpers ──────────────────────────────────────────────────────────────
+# ── Proxy helpers ─────────────────────────────────────────────────────────────
 
-def make_session() -> requests.Session:
-    # curl_cffi: pass impersonate= so it uses Chrome's real TLS fingerprint.
-    # Without this, Cloudflare rejects GH Actions IPs via JA3/JA4 fingerprinting.
+def _mask(proxy_url: str) -> str:
+    """Hide password in proxy URL for safe logging."""
+    return re.sub(r":[^:@/]+@", ":***@", proxy_url)
+
+
+def make_session(proxy: str = "") -> requests.Session:
+    """
+    Build a requests/curl_cffi session.
+    curl_cffi impersonates Chrome 124 TLS fingerprint — bypasses Cloudflare JA3/JA4.
+    proxy: full URL like http://user:pass@host:port
+    """
     try:
         s = requests.Session(impersonate="chrome124")
     except TypeError:
         s = requests.Session()  # plain requests fallback
+
     s.headers.update({
         "User-Agent":                USER_AGENT,
         "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -112,7 +127,7 @@ def make_session() -> requests.Session:
         "Accept-Encoding":           "gzip, deflate, br",
         "Cache-Control":             "no-cache",
         "Pragma":                    "no-cache",
-        "Sec-Ch-Ua":                 '"Chromium";v="150", "Google Chrome";v="150", "Not:A-Brand";v="99"',
+        "Sec-Ch-Ua":                 '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
         "Sec-Ch-Ua-Mobile":          "?0",
         "Sec-Ch-Ua-Platform":        '"Windows"',
         "Sec-Fetch-Dest":            "document",
@@ -122,27 +137,30 @@ def make_session() -> requests.Session:
         "Upgrade-Insecure-Requests": "1",
         "DNT":                       "1",
     })
-    if SCRAPER_PROXY:
-        s.proxies = {"http": SCRAPER_PROXY, "https": SCRAPER_PROXY}
-        log.info("Using proxy: %s", re.sub(r":[^:@]+@", ":***@", SCRAPER_PROXY))
+
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
+        log.info("  Session proxy: %s", _mask(proxy))
+
     return s
 
 
-def safe_get(session: requests.Session, url: str, label: str, **kwargs) -> requests.Response:
+# ── HTTP helper ───────────────────────────────────────────────────────────────
+
+def safe_get(session, url: str, label: str, **kwargs):
     """
-    Wrapper around session.get() that:
-      - logs request/response details at DEBUG level
+    GET with error handling:
       - retries once on 429 (rate limit)
-      - raises a descriptive RuntimeError on any other HTTP error
+      - raises RuntimeError with clear message on 403/404/other errors
     """
-    log.debug("GET %s  kwargs=%s", url, kwargs.get("headers", {}))
+    log.debug("GET %s", url)
     try:
-        resp = session.get(url, **kwargs)
+        resp = session.get(url, timeout=30, **kwargs)
     except _ConnErr as exc:
         raise RuntimeError(
             f"[{label}] Connection failed for {url}\n"
             f"  Cause: {exc}\n"
-            "  → Check your network / DNS, or the site may be down."
+            "  → Check proxy settings or network."
         ) from exc
     except _TimeoutErr as exc:
         raise RuntimeError(
@@ -161,13 +179,12 @@ def safe_get(session: requests.Session, url: str, label: str, **kwargs) -> reque
         retry_after = int(resp.headers.get("Retry-After", 10))
         log.warning("[%s] Rate limited (429). Sleeping %ds …", label, retry_after)
         time.sleep(retry_after)
-        return safe_get(session, url, label, **kwargs)  # single retry
+        return safe_get(session, url, label, **kwargs)
 
     if resp.status_code == 403:
         raise RuntimeError(
             f"[{label}] 403 Forbidden — {url}\n"
-            "  → The site may have blocked automated requests. "
-            "Try increasing DELAY or updating the User-Agent."
+            "  → IP is blocked. Proxy will be rotated if available."
         )
 
     if resp.status_code == 404:
@@ -178,7 +195,7 @@ def safe_get(session: requests.Session, url: str, label: str, **kwargs) -> reque
 
     try:
         resp.raise_for_status()
-    except requests.HTTPError as exc:
+    except Exception as exc:
         raise RuntimeError(
             f"[{label}] HTTP {resp.status_code} for {url}\n"
             f"  Body (first 500 chars): {resp.text[:500]}\n"
@@ -188,35 +205,73 @@ def safe_get(session: requests.Session, url: str, label: str, **kwargs) -> reque
     return resp
 
 
+# ── Proxy-rotating request ────────────────────────────────────────────────────
+
+def get_with_proxy_rotation(url: str, label: str, extra_headers: dict = None) -> tuple:
+    """
+    Try each proxy in PROXY_LIST in order.
+    Falls back to no-proxy if list is empty or all fail.
+    Returns (response, session) of the first successful attempt.
+    """
+    kwargs = {}
+    if extra_headers:
+        kwargs["headers"] = extra_headers
+
+    proxies_to_try = PROXY_LIST if PROXY_LIST else [""]  # "" = no proxy
+
+    last_exc = None
+    for i, proxy in enumerate(proxies_to_try):
+        attempt_label = f"proxy {i+1}/{len(proxies_to_try)}" if proxy else "no proxy"
+        log.info("  Trying %s …", attempt_label if not proxy else f"{attempt_label} ({_mask(proxy)})")
+
+        session = make_session(proxy)
+        try:
+            resp = safe_get(session, url, label, **kwargs)
+            log.info("  ✓ Success with %s", attempt_label)
+            return resp, session
+        except RuntimeError as exc:
+            err_str = str(exc)
+            log.warning("  ✗ Failed (%s): %s", attempt_label, err_str.split("\n")[0])
+            last_exc = exc
+            if i < len(proxies_to_try) - 1:
+                log.info("  Rotating to next proxy …")
+                time.sleep(1)
+            continue
+
+    raise RuntimeError(
+        f"All {len(proxies_to_try)} proxy attempt(s) failed for {url}.\n"
+        f"  Last error: {last_exc}"
+    )
+
+
 # ── Core scraping functions ───────────────────────────────────────────────────
 
-def get_anime_id(session: requests.Session, slug: str) -> int:
-    url  = f"{BASE_URL}/anime/{slug}"
+def get_anime_id(slug: str) -> tuple:
+    """Returns (anime_id, session) — reuses the session that worked."""
+    url = f"{BASE_URL}/anime/{slug}"
     log.info("Fetching anime page: %s", url)
-    resp = safe_get(session, url, "anime-page", headers={"Accept": "text/html"})
 
-    # Detect Cloudflare / bot-block pages before the regex
+    resp, session = get_with_proxy_rotation(
+        url, "anime-page",
+        extra_headers={"Accept": "text/html"}
+    )
+
+    # Detect Cloudflare challenge page
     cf_indicators = [
         "cf-browser-verification",
-        "cloudflare",
-        "Just a moment",
-        "Checking if the site connection is secure",
-        "Enable JavaScript and cookies to continue",
-        "DDoS protection by Cloudflare",
-        "Ray ID",
+        "just a moment",
+        "checking if the site connection is secure",
+        "enable javascript and cookies to continue",
+        "ddos protection by cloudflare",
     ]
     page_lower = resp.text.lower()
-    cf_hit = [ind for ind in cf_indicators if ind.lower() in page_lower]
+    cf_hit = [ind for ind in cf_indicators if ind in page_lower]
     if cf_hit:
         log.debug("Page HTML (first 3000 chars):\n%s", resp.text[:3000])
         raise RuntimeError(
-            "Cloudflare / bot-detection challenge page received — the site is blocking GitHub Actions IPs.\n"
-            f"  → Detected indicators: {cf_hit}\n"
-            "  → Solutions:\n"
-            "       1. Add SCRAPER_PROXY env var with a residential proxy URL (see README)\n"
-            "       2. Use a self-hosted runner on a residential IP\n"
-            "       3. Increase DELAY and retry — sometimes a single retry works\n"
-            f"  → Tried slug: {slug}"
+            "Cloudflare challenge page received — TLS fingerprint passed but JS challenge active.\n"
+            f"  → Indicators: {cf_hit}\n"
+            "  → Try adding more residential proxies to SCRAPER_PROXY_LIST."
         )
 
     m = re.search(r"watchPage\((\d+)", resp.text)
@@ -231,10 +286,10 @@ def get_anime_id(session: requests.Session, slug: str) -> int:
 
     anime_id = int(m.group(1))
     log.info("Anime ID: %d", anime_id)
-    return anime_id
+    return anime_id, session
 
 
-def fetch_episodes(session: requests.Session, anime_id: int) -> list[dict]:
+def fetch_episodes(session, anime_id: int) -> list:
     url = f"{BASE_URL}/api/frontend/anime/{anime_id}/episodes"
     log.info("Fetching episode list …")
     resp = safe_get(session, url, "episode-list", headers={
@@ -245,7 +300,7 @@ def fetch_episodes(session: requests.Session, anime_id: int) -> list[dict]:
 
     try:
         data = resp.json()
-    except json.JSONDecodeError as exc:
+    except Exception as exc:
         log.debug("Raw body: %s", resp.text[:1000])
         raise RuntimeError(
             f"Episode list API returned non-JSON.\n"
@@ -257,7 +312,6 @@ def fetch_episodes(session: requests.Session, anime_id: int) -> list[dict]:
     if not episodes:
         raise RuntimeError(
             "Episode list is empty.\n"
-            "  → The anime ID may be wrong, or the anime has no episodes listed yet.\n"
             f"  → Anime ID used: {anime_id}"
         )
 
@@ -266,7 +320,7 @@ def fetch_episodes(session: requests.Session, anime_id: int) -> list[dict]:
     return episodes
 
 
-def fetch_languages(session: requests.Session, ep_id: int) -> list[dict]:
+def fetch_languages(session, ep_id: int) -> list:
     url = f"{BASE_URL}/api/frontend/episode/{ep_id}/languages"
     resp = safe_get(session, url, f"ep-{ep_id}-languages", headers={
         "Accept":           "application/json",
@@ -276,7 +330,7 @@ def fetch_languages(session: requests.Session, ep_id: int) -> list[dict]:
 
     try:
         data = resp.json()
-    except json.JSONDecodeError as exc:
+    except Exception as exc:
         log.debug("Raw body for ep %d: %s", ep_id, resp.text[:500])
         raise RuntimeError(
             f"Languages API for episode {ep_id} returned non-JSON.\n"
@@ -290,24 +344,30 @@ def fetch_languages(session: requests.Session, ep_id: int) -> list[dict]:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main() -> list[dict]:
+def main() -> list:
     log.info("══════════════════════════════════════════")
     log.info(" AniDB Embed Scraper — GitHub Actions")
     log.info("══════════════════════════════════════════")
     log.info("Config:")
-    log.info("  ANIME_SLUG  = %s", ANIME_SLUG)
-    log.info("  LANG_FILTER = %s", LANG_FILTER)
-    log.info("  EP_START    = %d", EP_START)
-    log.info("  EP_END      = %s", EP_END if EP_END is not None else "(last)")
-    log.info("  DELAY       = %.1fs", DELAY)
-    log.info("  OUTPUT_FILE = %s", OUTPUT_FILE)
-    log.info("  DEBUG       = %s", DEBUG)
-    log.info("  LOG_FILE    = %s", LOG_FILE)
+    log.info("  ANIME_SLUG   = %s", ANIME_SLUG)
+    log.info("  LANG_FILTER  = %s", LANG_FILTER)
+    log.info("  EP_START     = %d", EP_START)
+    log.info("  EP_END       = %s", EP_END if EP_END is not None else "(last)")
+    log.info("  DELAY        = %.1fs", DELAY)
+    log.info("  OUTPUT_FILE  = %s", OUTPUT_FILE)
+    log.info("  DEBUG        = %s", DEBUG)
+    log.info("  LOG_FILE     = %s", LOG_FILE)
+    log.info("  CURL_CFFI    = %s", CURL_CFFI)
+    if PROXY_LIST:
+        log.info("  PROXIES      = %d configured", len(PROXY_LIST))
+        for i, p in enumerate(PROXY_LIST, 1):
+            log.info("    [%d] %s", i, _mask(p))
+    else:
+        log.info("  PROXIES      = none (direct connection)")
     log.info("")
 
-    session  = make_session()
-    anime_id = get_anime_id(session, ANIME_SLUG)
-    all_eps  = fetch_episodes(session, anime_id)
+    anime_id, session = get_anime_id(ANIME_SLUG)
+    all_eps = fetch_episodes(session, anime_id)
 
     ep_end_eff = EP_END if EP_END is not None else all_eps[-1]["number"]
     episodes   = [e for e in all_eps if EP_START <= e["number"] <= ep_end_eff]
@@ -320,8 +380,8 @@ def main() -> list[dict]:
 
     log.info("Scraping episodes %d–%d (%d episodes)", EP_START, ep_end_eff, len(episodes))
 
-    results      = []
-    failed_eps   = []
+    results    = []
+    failed_eps = []
 
     for i, ep in enumerate(episodes, 1):
         ep_num = ep["number"]
@@ -329,17 +389,38 @@ def main() -> list[dict]:
         filler = ep.get("filler", False)
         label  = f"Ep {ep_num:>4}" + (" [FILLER]" if filler else "")
 
-        # Progress (CI-friendly: no \r, just periodic lines)
         if i == 1 or i % 10 == 0 or i == len(episodes):
             log.info("  Progress: %d/%d  %s", i, len(episodes), label)
 
         try:
             langs = fetch_languages(session, ep_id)
         except RuntimeError as exc:
-            log.error("  FAILED: %s — %s", label, exc)
-            failed_eps.append({"episode": ep_num, "ep_id": ep_id, "error": str(exc)})
-            time.sleep(DELAY)
-            continue
+            # On 403 mid-scrape, try rotating the proxy for this episode
+            if "403" in str(exc) and PROXY_LIST:
+                log.warning("  403 mid-scrape on %s — attempting proxy rotation …", label)
+                try:
+                    url = f"{BASE_URL}/api/frontend/episode/{ep_id}/languages"
+                    resp, session = get_with_proxy_rotation(
+                        url, f"ep-{ep_id}-languages-retry",
+                        extra_headers={
+                            "Accept":           "application/json",
+                            "X-Requested-With": "XMLHttpRequest",
+                            "Referer":          f"{BASE_URL}/anime/{ANIME_SLUG}",
+                        }
+                    )
+                    data  = resp.json()
+                    langs = data.get("languages", [])
+                    log.info("  ✓ Recovered %s via proxy rotation", label)
+                except Exception as retry_exc:
+                    log.error("  FAILED (after rotation): %s — %s", label, retry_exc)
+                    failed_eps.append({"episode": ep_num, "ep_id": ep_id, "error": str(retry_exc)})
+                    time.sleep(DELAY)
+                    continue
+            else:
+                log.error("  FAILED: %s — %s", label, exc)
+                failed_eps.append({"episode": ep_num, "ep_id": ep_id, "error": str(exc)})
+                time.sleep(DELAY)
+                continue
 
         time.sleep(DELAY)
 
@@ -386,13 +467,12 @@ def main() -> list[dict]:
         log.info("")
         log.info("Saved %d episodes → %s", len(results), OUTPUT_FILE)
         if failed_eps:
-            log.info("Failure details also saved to: %s  (field: 'failures')", OUTPUT_FILE)
+            log.info("Failure details also in: %s  (field: 'failures')", OUTPUT_FILE)
 
     log.info("Debug log written to: %s", LOG_FILE)
 
-    # Exit with non-zero code if any episodes failed — makes GH Actions mark the step ✗
     if failed_eps and len(failed_eps) == len(episodes):
-        sys.exit(1)   # total failure
+        sys.exit(1)  # total failure — mark Actions step as ✗
 
     return results
 
@@ -400,7 +480,7 @@ def main() -> list[dict]:
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:                          # top-level catch for debug output
+    except Exception as exc:
         log.error("")
         log.error("╔══════════════════════════════════════════╗")
         log.error("║          SCRAPER FAILED — DEBUG          ║")
@@ -416,6 +496,7 @@ if __name__ == "__main__":
         log.error("  EP_START    = %d", EP_START)
         log.error("  EP_END      = %s", EP_END)
         log.error("  DELAY       = %s", DELAY)
+        log.error("  PROXIES     = %d", len(PROXY_LIST))
         log.error("  DEBUG       = %s", DEBUG)
         log.error("")
         log.error("→ Full debug log saved to: %s", LOG_FILE)
