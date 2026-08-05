@@ -55,12 +55,16 @@ jobs:
 
       - name: Run scraper
         env:
-          ANIME_SLUG:  ${{ github.event.inputs.anime_slug  || 'naruto-shippuden-3687' }}
-          LANG_FILTER: ${{ github.event.inputs.lang_filter  || 'all' }}
-          EP_START:    ${{ github.event.inputs.ep_start     || '1' }}
-          EP_END:      ${{ github.event.inputs.ep_end       || '' }}
-          DELAY:       ${{ github.event.inputs.delay        || '0.5' }}
-          DEBUG:       ${{ github.event.inputs.debug        || 'false' }}
+          ANIME_SLUG:    ${{ github.event.inputs.anime_slug  || 'naruto-shippuden-3687' }}
+          LANG_FILTER:   ${{ github.event.inputs.lang_filter  || 'all' }}
+          EP_START:      ${{ github.event.inputs.ep_start     || '1' }}
+          EP_END:        ${{ github.event.inputs.ep_end       || '' }}
+          DELAY:         ${{ github.event.inputs.delay        || '0.5' }}
+          DEBUG:         ${{ github.event.inputs.debug        || 'false' }}
+          # Optional: add a residential proxy to bypass Cloudflare on GH Actions IPs
+          # Store as a repo secret: Settings → Secrets → SCRAPER_PROXY
+          # Format: http://user:pass@host:port  (leave secret unset to disable)
+          SCRAPER_PROXY: ${{ secrets.SCRAPER_PROXY }}
         run: |
           python anidb_embed_scraper.py
 
