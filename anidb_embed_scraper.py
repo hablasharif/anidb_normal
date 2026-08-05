@@ -30,9 +30,17 @@ import traceback
 from pathlib import Path
 
 try:
-    from curl_cffi import requests  # Chrome TLS fingerprint — bypasses Cloudflare JA3/JA4
+    from curl_cffi import requests                      # Chrome TLS fingerprint — bypasses Cloudflare JA3/JA4
+    from curl_cffi.requests.exceptions import (
+        ConnectionError as _ConnErr,
+        Timeout         as _TimeoutErr,
+    )
+    CURL_CFFI = True
 except ImportError:
-    import requests  # fallback (will not bypass Cloudflare on GH Actions)
+    import requests                                     # fallback (will not bypass Cloudflare on GH Actions)
+    _ConnErr    = requests.ConnectionError
+    _TimeoutErr = requests.Timeout
+    CURL_CFFI   = False
 
 # ══════════════════════════════════════════
 #  CONFIG  (env vars override these defaults)
@@ -94,7 +102,7 @@ def make_session() -> requests.Session:
     # curl_cffi: pass impersonate= so it uses Chrome's real TLS fingerprint.
     # Without this, Cloudflare rejects GH Actions IPs via JA3/JA4 fingerprinting.
     try:
-        s = requests.Session(impersonate="chrome150")
+        s = requests.Session(impersonate="chrome124")
     except TypeError:
         s = requests.Session()  # plain requests fallback
     s.headers.update({
@@ -130,13 +138,13 @@ def safe_get(session: requests.Session, url: str, label: str, **kwargs) -> reque
     log.debug("GET %s  kwargs=%s", url, kwargs.get("headers", {}))
     try:
         resp = session.get(url, **kwargs)
-    except requests.ConnectionError as exc:
+    except _ConnErr as exc:
         raise RuntimeError(
             f"[{label}] Connection failed for {url}\n"
             f"  Cause: {exc}\n"
             "  → Check your network / DNS, or the site may be down."
         ) from exc
-    except requests.Timeout as exc:
+    except _TimeoutErr as exc:
         raise RuntimeError(
             f"[{label}] Request timed out for {url}\n"
             f"  Cause: {exc}"
