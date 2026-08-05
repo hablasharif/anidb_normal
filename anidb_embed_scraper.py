@@ -29,7 +29,10 @@ import time
 import traceback
 from pathlib import Path
 
-import requests
+try:
+    from curl_cffi import requests  # Chrome TLS fingerprint — bypasses Cloudflare JA3/JA4
+except ImportError:
+    import requests  # fallback (will not bypass Cloudflare on GH Actions)
 
 # ══════════════════════════════════════════
 #  CONFIG  (env vars override these defaults)
@@ -88,7 +91,12 @@ log = setup_logging()
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 def make_session() -> requests.Session:
-    s = requests.Session()
+    # curl_cffi: pass impersonate= so it uses Chrome's real TLS fingerprint.
+    # Without this, Cloudflare rejects GH Actions IPs via JA3/JA4 fingerprinting.
+    try:
+        s = requests.Session(impersonate="chrome150")
+    except TypeError:
+        s = requests.Session()  # plain requests fallback
     s.headers.update({
         "User-Agent":                USER_AGENT,
         "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
