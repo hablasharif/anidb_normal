@@ -35,14 +35,15 @@ import requests
 #  CONFIG  (env vars override these defaults)
 # ══════════════════════════════════════════
 
-ANIME_SLUG  = os.environ.get("ANIME_SLUG",   "naruto-shippuden-3687")
+ANIME_SLUG   = os.environ.get("ANIME_SLUG",   "naruto-shippuden-3687")
 LANG_FILTER = os.environ.get("LANG_FILTER",  "all")
 EP_START    = int(os.environ.get("EP_START", "1"))
 _ep_end_raw = os.environ.get("EP_END",       "").strip()
 EP_END      = int(_ep_end_raw) if _ep_end_raw else None
 DELAY       = float(os.environ.get("DELAY",  "0.5"))
 OUTPUT_FILE = os.environ.get("OUTPUT_FILE",  "anidb_embeds.json")
-DEBUG       = os.environ.get("DEBUG", "false").lower() == "true"
+DEBUG        = os.environ.get("DEBUG", "false").lower() == "true"
+SCRAPER_PROXY = os.environ.get("SCRAPER_PROXY", "").strip()  # e.g. "http://user:pass@host:port"
 
 # ══════════════════════════════════════════
 
@@ -89,10 +90,25 @@ log = setup_logging()
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
-        "User-Agent":      USER_AGENT,
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "User-Agent":                USER_AGENT,
+        "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language":           "en-US,en;q=0.9",
+        "Accept-Encoding":           "gzip, deflate, br",
+        "Cache-Control":             "no-cache",
+        "Pragma":                    "no-cache",
+        "Sec-Ch-Ua":                 '"Chromium";v="150", "Google Chrome";v="150", "Not:A-Brand";v="99"',
+        "Sec-Ch-Ua-Mobile":          "?0",
+        "Sec-Ch-Ua-Platform":        '"Windows"',
+        "Sec-Fetch-Dest":            "document",
+        "Sec-Fetch-Mode":            "navigate",
+        "Sec-Fetch-Site":            "none",
+        "Sec-Fetch-User":            "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "DNT":                       "1",
     })
+    if SCRAPER_PROXY:
+        s.proxies = {"http": SCRAPER_PROXY, "https": SCRAPER_PROXY}
+        log.info("Using proxy: %s", re.sub(r":[^:@]+@", ":***@", SCRAPER_PROXY))
     return s
 
 
@@ -162,6 +178,30 @@ def get_anime_id(session: requests.Session, slug: str) -> int:
     url  = f"{BASE_URL}/anime/{slug}"
     log.info("Fetching anime page: %s", url)
     resp = safe_get(session, url, "anime-page", headers={"Accept": "text/html"})
+
+    # Detect Cloudflare / bot-block pages before the regex
+    cf_indicators = [
+        "cf-browser-verification",
+        "cloudflare",
+        "Just a moment",
+        "Checking if the site connection is secure",
+        "Enable JavaScript and cookies to continue",
+        "DDoS protection by Cloudflare",
+        "Ray ID",
+    ]
+    page_lower = resp.text.lower()
+    cf_hit = [ind for ind in cf_indicators if ind.lower() in page_lower]
+    if cf_hit:
+        log.debug("Page HTML (first 3000 chars):\n%s", resp.text[:3000])
+        raise RuntimeError(
+            "Cloudflare / bot-detection challenge page received — the site is blocking GitHub Actions IPs.\n"
+            f"  → Detected indicators: {cf_hit}\n"
+            "  → Solutions:\n"
+            "       1. Add SCRAPER_PROXY env var with a residential proxy URL (see README)\n"
+            "       2. Use a self-hosted runner on a residential IP\n"
+            "       3. Increase DELAY and retry — sometimes a single retry works\n"
+            f"  → Tried slug: {slug}"
+        )
 
     m = re.search(r"watchPage\((\d+)", resp.text)
     if not m:
